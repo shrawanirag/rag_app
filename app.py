@@ -73,6 +73,17 @@ def split_sentences(text: str):
     sentences = re.split(r"(?<=[.!?])\s+", text)
     return [s for s in sentences if s.strip()]
 
+def split_front_matter(text: str):
+    """Splits off the title/author/affiliation block that sits before the
+    Abstract, so it can become its own chunk instead of being diluted inside
+    a 180-word block dominated by abstract content."""
+    match = re.search(r"\b(abstract)\b", text, re.IGNORECASE)
+    if match and match.start() < 800:  # only trust this if it's near the top of the doc
+        front_matter = text[:match.start()].strip()
+        rest = text[match.start():].strip()
+        return front_matter, rest
+    return "", text  # no reliable marker found — treat the whole thing as one body
+
 
 def chunk_text(text, chunk_size=CHUNK_SIZE, overlap_words=CHUNK_OVERLAP_WORDS):
     """Sentence-aware chunking: packs whole sentences into each chunk until
@@ -216,7 +227,10 @@ if build_button:
             all_chunks = []
             for f in uploaded_files:
                 text = extract_text(f)
-                all_chunks.extend(chunk_text(text))
+                front_matter, body = split_front_matter(text)
+                if front_matter:
+                     all_chunks.append(front_matter)
+                all_chunks.extend(chunk_text(body))
 
             if not all_chunks:
                 st.sidebar.error("Couldn't extract any text from the uploaded files.")
