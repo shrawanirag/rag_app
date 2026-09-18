@@ -2,16 +2,6 @@
 Simple RAG (Retrieval-Augmented Generation) App
 ------------------------------------------------
 Upload your notes/PDFs, ask questions, get answers grounded in your own documents.
-
-Pipeline:
-  1. Upload PDF/TXT files
-  2. Split into overlapping text chunks
-  3. Embed chunks with a local sentence-transformer model
-  4. Store embeddings in a FAISS index (in-memory)
-  5. On each question: embed the query, retrieve top-k similar chunks,
-     pass them + the question to Gemini, and display the grounded answer.
-
-Run with:  streamlit run app.py
 """
 
 import streamlit as st
@@ -24,11 +14,11 @@ from google import genai
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"   # small, fast, runs locally (CPU is fine)
-CHUNK_SIZE = 300                        # words per chunk
-CHUNK_OVERLAP = 50                      # words of overlap between chunks
-TOP_K = 4                               # how many chunks to retrieve per question
-GEMINI_MODEL = "gemini-3.6-flash"       # free-tier friendly; change if you want a different Gemini model
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
+TOP_K = 4
+GEMINI_MODEL = "gemini-3.6-flash"
 
 st.set_page_config(page_title="Notes RAG Chat", page_icon="📚")
 
@@ -38,12 +28,10 @@ st.set_page_config(page_title="Notes RAG Chat", page_icon="📚")
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_embedder():
-    """Load the embedding model once and cache it across reruns."""
     return SentenceTransformer(EMBED_MODEL_NAME)
 
 
 def extract_text(uploaded_file) -> str:
-    """Extract raw text from an uploaded PDF or TXT file."""
     if uploaded_file.name.lower().endswith(".pdf"):
         reader = PdfReader(uploaded_file)
         return "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -51,8 +39,7 @@ def extract_text(uploaded_file) -> str:
         return uploaded_file.read().decode("utf-8", errors="ignore")
 
 
-def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into overlapping word-based chunks."""
+def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     words = text.split()
     chunks = []
     start = 0
@@ -66,26 +53,30 @@ def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
 
 def build_index(chunks, embedder):
-    """Embed all chunks and build a FAISS index (cosine similarity via normalized vectors)."""
     embeddings = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
     embeddings = np.array(embeddings, dtype="float32")
-    index = faiss.IndexFlatIP(embeddings.shape[1])  # inner product == cosine on normalized vectors
+    index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
     return index
 
 
 def retrieve(query, embedder, index, chunks, top_k=TOP_K):
-    """Embed the query and return the top_k most similar chunks."""
+    """Returns a list of (chunk_number, chunk_text, similarity_score), ranked best first.
+    chunk_number is 1-indexed to match how you'd refer to 'chunk 5' when inspecting your data."""
     q_emb = embedder.encode([query], normalize_embeddings=True)
     q_emb = np.array(q_emb, dtype="float32")
     scores, idxs = index.search(q_emb, top_k)
-    results = [chunks[i] for i in idxs[0] if i != -1]
+    results = [
+        (int(i) + 1, chunks[i], float(score))
+        for i, score in zip(idxs[0], scores[0])
+        if i != -1
+    ]
     return results
 
 
-def ask_gemini(client, question, retrieved_chunks):
-    """Send the question + retrieved context to Gemini and return the answer."""
-    context = "\n\n---\n\n".join(retrieved_chunks)
+def ask_gemini(client, question, retrieved):
+    """retrieved is a list of (chunk_number, chunk_text, score)."""
+    context = "\n\n---\n\n".join(chunk_text for _, chunk_text, _ in retrieved)
     system_prompt = (
         "You are a study assistant. Answer the user's question using ONLY the "
         "context provided below. If the answer isn't in the context, say so clearly "
@@ -109,8 +100,6 @@ st.caption("Upload your notes or PDFs, then ask questions grounded in them.")
 
 with st.sidebar:
     st.header("Setup")
-    # If you deploy this yourself and add GEMINI_API_KEY to Streamlit secrets,
-    # visitors won't need to paste their own key. Otherwise they enter their own below.
     default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
     api_key = st.text_input("Gemini API key", type="password", value=default_key)
     st.markdown("[Get a free key from Google AI Studio](https://aistudio.google.com/apikey)")
@@ -121,13 +110,11 @@ with st.sidebar:
     )
     build_button = st.button("Build knowledge base", type="primary")
 
-# Session state
 if "index" not in st.session_state:
     st.session_state.index = None
     st.session_state.chunks = []
     st.session_state.messages = []
 
-# Build the index when the user clicks the button
 if build_button:
     if not uploaded_files:
         st.sidebar.error("Upload at least one file first.")
@@ -147,10 +134,16 @@ if build_button:
                 st.session_state.messages = []
                 st.sidebar.success(f"Indexed {len(all_chunks)} chunks from {len(uploaded_files)} file(s).")
 
-# Chat interface
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        # Re-show retrieval info for past messages too, if this message has it attached
+        if "retrieved" in msg:
+            with st.expander(f"Sources used ({len(msg['retrieved'])} chunks)"):
+                for chunk_num, chunk_txt, score in msg["retrieved"]:
+                    st.markdown(f"**Chunk {chunk_num}** — similarity score: `{score:.3f}`")
+                    st.text(chunk_txt[:400] + ("..." if len(chunk_txt) > 400 else ""))
+                    st.divider()
 
 question = st.chat_input("Ask a question about your uploaded documents...")
 
@@ -172,8 +165,17 @@ if question:
                 answer = ask_gemini(client, question, retrieved)
 
                 st.markdown(answer)
-                with st.expander("Retrieved context used for this answer"):
-                    for i, chunk in enumerate(retrieved, 1):
-                        st.markdown(f"**Chunk {i}:**\n\n{chunk}")
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+                # This is the key visibility panel: chunk number + similarity score for every
+                # chunk that was actually handed to Gemini for this specific answer.
+                with st.expander(f"Sources used ({len(retrieved)} chunks)"):
+                    for chunk_num, chunk_txt, score in retrieved:
+                        st.markdown(f"**Chunk {chunk_num}** — similarity score: `{score:.3f}`")
+                        st.text(chunk_txt[:400] + ("..." if len(chunk_txt) > 400 else ""))
+                        st.divider()
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "retrieved": retrieved,
+        })
