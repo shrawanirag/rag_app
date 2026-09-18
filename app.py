@@ -1,9 +1,32 @@
 """
-Simple RAG (Retrieval-Augmented Generation) App
-------------------------------------------------
+Simple RAG (Retrieval-Augmented Generation) App — improved version
+--------------------------------------------------------------------
 Upload your notes/PDFs, ask questions, get answers grounded in your own documents.
+
+Changes from the first version, and why:
+
+1. CHUNK_SIZE dropped from 300 to 180 words.
+   all-MiniLM-L6-v2 truncates at 256 tokens. English averages ~1.3 tokens/word,
+   so 300 words (~390 tokens) was silently getting cut off before embedding.
+   180 words (~235 tokens) stays safely under the limit.
+
+2. Chunking is now sentence-aware instead of a blind word-count cut.
+   The old version could slice a sentence in half at exactly word 300, regardless
+   of where that fell. This version only ends a chunk at a sentence boundary,
+   so every chunk is made of whole, coherent sentences.
+
+3. TOP_K raised from 4 to 6.
+   Gives retrieval a bit more room to catch relevant chunks that don't score
+   as the single highest match but are still genuinely useful.
+
+4. Retrieval confidence checking.
+   If the best similarity score for a question is low (below CONFIDENCE_THRESHOLD),
+   that means nothing in the document is a strong match - FAISS still returns its
+   top-k regardless of quality. The app now surfaces this instead of silently
+   treating a weak match like a good one.
 """
 
+import re
 import streamlit as st
 import numpy as np
 import faiss
@@ -15,9 +38,10 @@ from google import genai
 # Config
 # ---------------------------------------------------------------------------
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-CHUNK_SIZE = 300
-CHUNK_OVERLAP = 50
-TOP_K = 4
+CHUNK_SIZE = 180              # words per chunk (token-safe for this embedder)
+CHUNK_OVERLAP_WORDS = 30      # approx words of overlap between chunks
+TOP_K = 6
+CONFIDENCE_THRESHOLD = 0.35   # below this, warn that retrieval confidence is low
 GEMINI_MODEL = "gemini-3.6-flash"
 
 st.set_page_config(page_title="Notes RAG Chat", page_icon="📚")
@@ -39,16 +63,42 @@ def extract_text(uploaded_file) -> str:
         return uploaded_file.read().decode("utf-8", errors="ignore")
 
 
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    words = text.split()
+def split_sentences(text: str):
+    """Naive sentence splitter: breaks after ., !, or ? followed by whitespace."""
+    text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return [s for s in sentences if s.strip()]
+
+
+def chunk_text(text, chunk_size=CHUNK_SIZE, overlap_words=CHUNK_OVERLAP_WORDS):
+    """Sentence-aware chunking: packs whole sentences into each chunk until
+    chunk_size words is reached, then starts the next chunk carrying over the
+    last few sentences (up to overlap_words) for continuity."""
+    sentences = split_sentences(text)
     chunks = []
-    start = 0
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        if chunk.strip():
-            chunks.append(chunk)
-        start += chunk_size - overlap
+    current = []
+    current_words = 0
+
+    for sent in sentences:
+        sent_word_count = len(sent.split())
+
+        if current_words + sent_word_count > chunk_size and current:
+            chunks.append(" ".join(current))
+            carry, carry_words = [], 0
+            for s in reversed(current):
+                sw = len(s.split())
+                if carry_words + sw > overlap_words:
+                    break
+                carry.insert(0, s)
+                carry_words += sw
+            current, current_words = carry, carry_words
+
+        current.append(sent)
+        current_words += sent_word_count
+
+    if current:
+        chunks.append(" ".join(current))
+
     return chunks
 
 
@@ -61,8 +111,7 @@ def build_index(chunks, embedder):
 
 
 def retrieve(query, embedder, index, chunks, top_k=TOP_K):
-    """Returns a list of (chunk_number, chunk_text, similarity_score), ranked best first.
-    chunk_number is 1-indexed to match how you'd refer to 'chunk 5' when inspecting your data."""
+    """Returns a list of (chunk_number, chunk_text, similarity_score), ranked best first."""
     q_emb = embedder.encode([query], normalize_embeddings=True)
     q_emb = np.array(q_emb, dtype="float32")
     scores, idxs = index.search(q_emb, top_k)
@@ -74,22 +123,43 @@ def retrieve(query, embedder, index, chunks, top_k=TOP_K):
     return results
 
 
-def ask_gemini(client, question, retrieved):
-    """retrieved is a list of (chunk_number, chunk_text, score)."""
+def ask_gemini(client, question, retrieved, low_confidence: bool):
     context = "\n\n---\n\n".join(chunk_text for _, chunk_text, _ in retrieved)
-    system_prompt = (
+
+    base_instructions = (
         "You are a study assistant. Answer the user's question using ONLY the "
         "context provided below. If the answer isn't in the context, say so clearly "
         "instead of guessing. Keep answers clear and well-explained, like a tutor."
     )
+    if low_confidence:
+        base_instructions += (
+            " IMPORTANT: none of the retrieved passages closely match this question. "
+            "Be extra cautious - if you can't find a clear, direct answer in the context, "
+            "say so explicitly rather than piecing together a guess."
+        )
+
     user_message = f"Context:\n{context}\n\nQuestion: {question}"
 
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=user_message,
-        config={"system_instruction": system_prompt, "max_output_tokens": 1000},
+        config={"system_instruction": base_instructions, "max_output_tokens": 1000},
     )
     return response.text
+
+
+def render_sources(retrieved, low_confidence: bool):
+    if low_confidence:
+        st.warning(
+            "Low retrieval confidence - the best-matching chunk scored below "
+            f"{CONFIDENCE_THRESHOLD}. This document may not actually contain a clear "
+            "answer to this question."
+        )
+    with st.expander(f"Sources used ({len(retrieved)} chunks)"):
+        for chunk_num, chunk_txt, score in retrieved:
+            st.markdown(f"**Chunk {chunk_num}** - similarity score: `{score:.3f}`")
+            st.text(chunk_txt[:400] + ("..." if len(chunk_txt) > 400 else ""))
+            st.divider()
 
 
 # ---------------------------------------------------------------------------
@@ -137,13 +207,8 @@ if build_button:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        # Re-show retrieval info for past messages too, if this message has it attached
         if "retrieved" in msg:
-            with st.expander(f"Sources used ({len(msg['retrieved'])} chunks)"):
-                for chunk_num, chunk_txt, score in msg["retrieved"]:
-                    st.markdown(f"**Chunk {chunk_num}** — similarity score: `{score:.3f}`")
-                    st.text(chunk_txt[:400] + ("..." if len(chunk_txt) > 400 else ""))
-                    st.divider()
+            render_sources(msg["retrieved"], msg.get("low_confidence", False))
 
 question = st.chat_input("Ask a question about your uploaded documents...")
 
@@ -161,21 +226,17 @@ if question:
             with st.spinner("Retrieving relevant chunks and generating answer..."):
                 embedder = load_embedder()
                 retrieved = retrieve(question, embedder, st.session_state.index, st.session_state.chunks)
+                low_confidence = (not retrieved) or (retrieved[0][2] < CONFIDENCE_THRESHOLD)
+
                 client = genai.Client(api_key=api_key)
-                answer = ask_gemini(client, question, retrieved)
+                answer = ask_gemini(client, question, retrieved, low_confidence)
 
                 st.markdown(answer)
-
-                # This is the key visibility panel: chunk number + similarity score for every
-                # chunk that was actually handed to Gemini for this specific answer.
-                with st.expander(f"Sources used ({len(retrieved)} chunks)"):
-                    for chunk_num, chunk_txt, score in retrieved:
-                        st.markdown(f"**Chunk {chunk_num}** — similarity score: `{score:.3f}`")
-                        st.text(chunk_txt[:400] + ("..." if len(chunk_txt) > 400 else ""))
-                        st.divider()
+                render_sources(retrieved, low_confidence)
 
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer,
             "retrieved": retrieved,
+            "low_confidence": low_confidence,
         })
