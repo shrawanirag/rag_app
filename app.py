@@ -3,36 +3,38 @@ Simple RAG (Retrieval-Augmented Generation) App — improved version
 --------------------------------------------------------------------
 Upload your notes/PDFs, ask questions, get answers grounded in your own documents.
 
-Changes from the first version, and why:
+Key design choices:
 
-1. CHUNK_SIZE dropped from 300 to 180 words.
-   all-MiniLM-L6-v2 truncates at 256 tokens. English averages ~1.3 tokens/word,
-   so 300 words (~390 tokens) was silently getting cut off before embedding.
-   180 words (~235 tokens) stays safely under the limit.
+1. CHUNK_SIZE = 180 words, not 300.
+   all-MiniLM-L6-v2 truncates at 256 tokens (~200 words). 180 words stays safely
+   under that so no chunk gets silently truncated before embedding.
 
-2. Chunking is now sentence-aware instead of a blind word-count cut.
-   The old version could slice a sentence in half at exactly word 300, regardless
-   of where that fell. This version only ends a chunk at a sentence boundary,
-   so every chunk is made of whole, coherent sentences.
+2. Sentence-aware chunking instead of a blind word-count cut.
+   Only ends a chunk at a sentence boundary, so no sentence gets sliced in half.
 
-3. TOP_K raised from 4 to 6.
-   Gives retrieval a bit more room to catch relevant chunks that don't score
-   as the single highest match but are still genuinely useful.
+3. TOP_K = 6, so retrieval has more room to catch genuinely relevant chunks.
 
 4. Retrieval confidence checking.
-   If the best similarity score for a question is low (below CONFIDENCE_THRESHOLD),
-   that means nothing in the document is a strong match - FAISS still returns its
-   top-k regardless of quality. The app now surfaces this instead of silently
-   treating a weak match like a good one.
+   If the best similarity score is low, the app warns instead of silently
+   treating a weak match as a good one.
+
+5. Retry logic around the Gemini call.
+   Gemini's free tier occasionally returns a transient 503 "model overloaded"
+   error that has nothing to do with your question - it's Google's servers
+   being briefly busy. Retrying after a short wait almost always succeeds.
+   Only transient server errors (5xx) are retried; a genuine problem like an
+   invalid API key (4xx) fails immediately instead of retrying uselessly.
 """
 
 import re
+import time
 import streamlit as st
 import numpy as np
 import faiss
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from google import genai
+from google.genai import errors as genai_errors
 
 # ---------------------------------------------------------------------------
 # Config
@@ -43,6 +45,8 @@ CHUNK_OVERLAP_WORDS = 30      # approx words of overlap between chunks
 TOP_K = 6
 CONFIDENCE_THRESHOLD = 0.35   # below this, warn that retrieval confidence is low
 GEMINI_MODEL = "gemini-3.6-flash"
+MAX_RETRIES = 3                # how many times to retry on a transient server error
+RETRY_BASE_DELAY_SECONDS = 2   # doubles each retry: 2s, 4s, 8s
 
 st.set_page_config(page_title="Notes RAG Chat", page_icon="📚")
 
@@ -124,6 +128,9 @@ def retrieve(query, embedder, index, chunks, top_k=TOP_K):
 
 
 def ask_gemini(client, question, retrieved, low_confidence: bool):
+    """Calls Gemini with retry logic for transient server errors (5xx).
+    Raises the original exception if all retries are exhausted, or immediately
+    for non-retryable errors (e.g. bad API key)."""
     context = "\n\n---\n\n".join(chunk_text for _, chunk_text, _ in retrieved)
 
     base_instructions = (
@@ -140,12 +147,27 @@ def ask_gemini(client, question, retrieved, low_confidence: bool):
 
     user_message = f"Context:\n{context}\n\nQuestion: {question}"
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user_message,
-        config={"system_instruction": base_instructions, "max_output_tokens": 1000},
-    )
-    return response.text
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=user_message,
+                config={"system_instruction": base_instructions, "max_output_tokens": 1000},
+            )
+            return response.text
+        except genai_errors.ServerError as e:
+            # Transient issue on Google's side (e.g. 503 "high demand") - worth retrying.
+            last_error = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+            continue
+        except genai_errors.ClientError:
+            # e.g. 400 invalid API key, invalid request - retrying won't help, fail fast.
+            raise
+
+    # All retries exhausted - raise the last error so the caller can show a clean message.
+    raise last_error
 
 
 def render_sources(retrieved, low_confidence: bool):
@@ -229,14 +251,31 @@ if question:
                 low_confidence = (not retrieved) or (retrieved[0][2] < CONFIDENCE_THRESHOLD)
 
                 client = genai.Client(api_key=api_key)
-                answer = ask_gemini(client, question, retrieved, low_confidence)
 
-                st.markdown(answer)
-                render_sources(retrieved, low_confidence)
+                try:
+                    answer = ask_gemini(client, question, retrieved, low_confidence)
+                except genai_errors.ServerError:
+                    answer = None
+                    st.error(
+                        "Gemini's servers are currently overloaded and didn't respond after "
+                        f"{MAX_RETRIES} attempts. This is temporary - please try asking again "
+                        "in a moment."
+                    )
+                except genai_errors.ClientError as e:
+                    answer = None
+                    st.error(
+                        "Gemini rejected the request - this usually means the API key is "
+                        f"invalid or missing permissions. Details: {e}"
+                    )
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "retrieved": retrieved,
-            "low_confidence": low_confidence,
-        })
+                if answer is not None:
+                    st.markdown(answer)
+                    render_sources(retrieved, low_confidence)
+
+        if answer is not None:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+                "retrieved": retrieved,
+                "low_confidence": low_confidence,
+            })
