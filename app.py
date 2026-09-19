@@ -142,7 +142,9 @@ def ask_gemini(client, question, retrieved, low_confidence: bool):
     """Calls Gemini with retry logic for transient server errors (5xx).
     Raises the original exception if all retries are exhausted, or immediately
     for non-retryable errors (e.g. bad API key)."""
-    context = "\n\n---\n\n".join(chunk_text for _, chunk_text, _ in retrieved)
+    doc_metadata = "\n\n".join(st.session_state.get("front_matters", []))
+    retrieved_context = "\n\n---\n\n".join(chunk_text for _, chunk_text, _ in retrieved)
+    context = f"Document metadata (title/author/etc.):\n{doc_metadata}\n\n---\n\nRetrieved passages:\n{retrieved_context}"
 
     base_instructions = (
         "You are a study assistant. Answer the user's question using ONLY the "
@@ -229,7 +231,7 @@ if build_button:
                 text = extract_text(f)
                 front_matter, body = split_front_matter(text)
                 if front_matter:
-                     all_chunks.append(front_matter)
+                    st.session_state.setdefault("front_matters", []).append(front_matter)
                 all_chunks.extend(chunk_text(body))
 
             if not all_chunks:
