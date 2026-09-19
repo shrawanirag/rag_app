@@ -186,9 +186,8 @@ def ask_gemini(client, question, retrieved, low_confidence: bool):
 def render_sources(retrieved, low_confidence: bool):
     if low_confidence:
         st.warning(
-            "Low retrieval confidence - the best-matching chunk scored below "
-            f"{CONFIDENCE_THRESHOLD}. This document may not actually contain a clear "
-            "answer to this question."
+            "Low retrieval confidence "
+            f"{CONFIDENCE_THRESHOLD}."
         )
     with st.expander(f"Sources used ({len(retrieved)} chunks)"):
         for chunk_num, chunk_txt, score in retrieved:
