@@ -186,7 +186,7 @@ def ask_gemini(client, question, retrieved, low_confidence: bool):
 def render_sources(retrieved, low_confidence: bool):
     if low_confidence:
         st.warning(
-            "Low retrieval confidence "
+            "Retrieval confidence "
             f"{CONFIDENCE_THRESHOLD}."
         )
     with st.expander(f"Sources used ({len(retrieved)} chunks)"):
