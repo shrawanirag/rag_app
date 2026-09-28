@@ -1,33 +1,27 @@
 """
-Simple RAG (Retrieval-Augmented Generation) App — improved version
---------------------------------------------------------------------
-Upload your notes/PDFs, ask questions, get answers grounded in your own documents.
+Notes RAG Chat — improved version
 
-Key design choices:
+Features:
+- Streamlit interface for PDF/TXT uploads and document-grounded Q&A
+- Sentence-aware, tokenizer-aware chunking
+- Chunk metadata (filename and PDF page where available)
+- FAISS cosine-similarity retrieval
+- Configurable retrieval threshold and top-k
+- Gemini retry handling for transient server errors
+- Source display with filenames, page numbers, chunk IDs, and scores
 
-1. CHUNK_SIZE = 180 words, not 300.
-   all-MiniLM-L6-v2 truncates at 256 tokens (~200 words). 180 words stays safely
-   under that so no chunk gets silently truncated before embedding.
+Install:
+pip install streamlit numpy faiss-cpu pypdf sentence-transformers google-genai
+Run:
+streamlit run app.py
 
-2. Sentence-aware chunking instead of a blind word-count cut.
-   Only ends a chunk at a sentence boundary, so no sentence gets sliced in half.
-
-3. TOP_K = 6, so retrieval has more room to catch genuinely relevant chunks.
-
-4. Retrieval confidence checking.
-   If the best similarity score is low, the app warns instead of silently
-   treating a weak match as a good one.
-
-5. Retry logic around the Gemini call.
-   Gemini's free tier occasionally returns a transient 503 "model overloaded"
-   error that has nothing to do with your question - it's Google's servers
-   being briefly busy. Retrying after a short wait almost always succeeds.
-   Only transient server errors (5xx) are retried; a genuine problem like an
-   invalid API key (4xx) fails immediately instead of retrying uselessly.
+Set GEMINI_API_KEY in .streamlit/secrets.toml or enter it in the sidebar.
 """
 
 import re
 import time
+from typing import Dict, List, Tuple, Any
+
 import streamlit as st
 import numpy as np
 import faiss
@@ -36,129 +30,261 @@ from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai import errors as genai_errors
 
+
 # ---------------------------------------------------------------------------
-# Config
+# Configuration
 # ---------------------------------------------------------------------------
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-CHUNK_SIZE = 180              # words per chunk (token-safe for this embedder)
-CHUNK_OVERLAP_WORDS = 30      # approx words of overlap between chunks
+
+# The embedding model has a 256-token input limit. Use a conservative budget
+# below that limit to leave room for special tokens.
+MAX_CHUNK_TOKENS = 220
+OVERLAP_TARGET_TOKENS = 40
+
 TOP_K = 6
-CONFIDENCE_THRESHOLD = 0.35   # below this, warn that retrieval confidence is low
+CONFIDENCE_THRESHOLD = 0.35
+
 GEMINI_MODEL = "gemini-3.6-flash"
-MAX_RETRIES = 3                # how many times to retry on a transient server error
-RETRY_BASE_DELAY_SECONDS = 2   # doubles each retry: 2s, 4s, 8s
+MAX_RETRIES = 3
+RETRY_BASE_DELAY_SECONDS = 2
 
 st.set_page_config(page_title="Notes RAG Chat", page_icon="📚")
+st.title("📚 Notes RAG Chat")
+st.caption("Upload your notes or PDFs, then ask questions grounded in them.")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Model loading and document extraction
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_embedder():
+    """Load and cache the embedding model for the Streamlit process."""
     return SentenceTransformer(EMBED_MODEL_NAME)
 
 
-def extract_text(uploaded_file) -> str:
-    if uploaded_file.name.lower().endswith(".pdf"):
+def extract_documents(uploaded_file) -> List[Dict[str, Any]]:
+    """
+    Return page/document records.
+
+    PDF: one record per page, preserving page numbers.
+    TXT: one record for the complete text.
+    """
+    filename = uploaded_file.name
+
+    if filename.lower().endswith(".pdf"):
         reader = PdfReader(uploaded_file)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    else:
-        return uploaded_file.read().decode("utf-8", errors="ignore")
+        documents = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                documents.append({
+                    "text": page_text,
+                    "source": filename,
+                    "page": page_number,
+                })
+        return documents
+
+    text = uploaded_file.read().decode("utf-8", errors="ignore")
+    return [{
+        "text": text,
+        "source": filename,
+        "page": None,
+    }] if text.strip() else []
 
 
-def split_sentences(text: str):
-    """Naive sentence splitter: breaks after ., !, or ? followed by whitespace."""
-    text = re.sub(r"\s+", " ", text).strip()
+def normalize_text(text: str) -> str:
+    """Normalize whitespace while preserving sentence punctuation."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_sentences(text: str) -> List[str]:
+    """
+    Simple sentence splitter. This is intentionally lightweight; abbreviations
+    such as 'Dr.' and decimal numbers may need a more advanced NLP splitter.
+    """
+    text = normalize_text(text)
+    if not text:
+        return []
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    return [s for s in sentences if s.strip()]
-
-def split_front_matter(text: str):
-    """Splits off the title/author/affiliation block that sits before the
-    Abstract, so it can become its own chunk instead of being diluted inside
-    a 180-word block dominated by abstract content."""
-    match = re.search(r"\b(abstract)\b", text, re.IGNORECASE)
-    if match and match.start() < 800:  # only trust this if it's near the top of the doc
-        front_matter = text[:match.start()].strip()
-        rest = text[match.start():].strip()
-        return front_matter, rest
-    return "", text  # no reliable marker found — treat the whole thing as one body
+    return [sentence.strip() for sentence in sentences if sentence.strip()]
 
 
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap_words=CHUNK_OVERLAP_WORDS):
-    """Sentence-aware chunking: packs whole sentences into each chunk until
-    chunk_size words is reached, then starts the next chunk carrying over the
-    last few sentences (up to overlap_words) for continuity."""
+def split_front_matter(text: str) -> Tuple[str, str]:
+    """Separate a leading title/author block when Abstract appears near top."""
+    match = re.search(r"\babstract\b", text, re.IGNORECASE)
+    if match and match.start() < 800:
+        return text[:match.start()].strip(), text[match.start():].strip()
+    return "", text
+
+
+def token_count(text: str, embedder) -> int:
+    """Count tokens with the same tokenizer used by the embedding model."""
+    return len(
+        embedder.tokenizer.encode(
+            text,
+            add_special_tokens=True,
+            truncation=False,
+        )
+    )
+
+
+def chunk_document(
+    text: str,
+    source: str,
+    page: int | None,
+    embedder,
+    max_tokens: int = MAX_CHUNK_TOKENS,
+    overlap_tokens: int = OVERLAP_TARGET_TOKENS,
+) -> List[Dict[str, Any]]:
+    """
+    Pack whole sentences into chunks under a tokenizer-based token budget.
+    Chunks overlap by carrying whole trailing sentences forward.
+
+    A single sentence longer than max_tokens is kept intact rather than
+    silently split; it is flagged in metadata so it can be reviewed.
+    """
     sentences = split_sentences(text)
     chunks = []
-    current = []
-    current_words = 0
+    current_sentences = []
+    current_text = ""
 
-    for sent in sentences:
-        sent_word_count = len(sent.split())
+    for sentence in sentences:
+        candidate = f"{current_text} {sentence}".strip()
+        candidate_tokens = token_count(candidate, embedder)
 
-        if current_words + sent_word_count > chunk_size and current:
-            chunks.append(" ".join(current))
-            carry, carry_words = [], 0
-            for s in reversed(current):
-                sw = len(s.split())
-                if carry_words + sw > overlap_words:
+        if current_sentences and candidate_tokens > max_tokens:
+            chunk_text = " ".join(current_sentences).strip()
+            chunks.append({
+                "text": chunk_text,
+                "source": source,
+                "page": page,
+                "oversize": token_count(chunk_text, embedder) > max_tokens,
+            })
+
+            # Carry complete trailing sentences for context overlap.
+            carry = []
+            carry_tokens = 0
+            for old_sentence in reversed(current_sentences):
+                sentence_tokens = token_count(old_sentence, embedder)
+                if carry and carry_tokens + sentence_tokens > overlap_tokens:
                     break
-                carry.insert(0, s)
-                carry_words += sw
-            current, current_words = carry, carry_words
+                if not carry and sentence_tokens > overlap_tokens:
+                    # Keep at least one trailing sentence, even if it is
+                    # larger than the nominal overlap target.
+                    carry.insert(0, old_sentence)
+                    carry_tokens += sentence_tokens
+                    break
+                carry.insert(0, old_sentence)
+                carry_tokens += sentence_tokens
 
-        current.append(sent)
-        current_words += sent_word_count
+            current_sentences = carry
+            current_text = " ".join(current_sentences)
 
-    if current:
-        chunks.append(" ".join(current))
+        current_sentences.append(sentence)
+        current_text = " ".join(current_sentences).strip()
+
+    if current_sentences:
+        chunk_text = " ".join(current_sentences).strip()
+        chunks.append({
+            "text": chunk_text,
+            "source": source,
+            "page": page,
+            "oversize": token_count(chunk_text, embedder) > max_tokens,
+        })
 
     return chunks
 
 
-def build_index(chunks, embedder):
-    embeddings = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
-    embeddings = np.array(embeddings, dtype="float32")
+# ---------------------------------------------------------------------------
+# Embedding, indexing, and retrieval
+# ---------------------------------------------------------------------------
+def build_index(chunks: List[Dict[str, Any]], embedder):
+    """Build a FAISS inner-product index over normalized embeddings."""
+    texts = [chunk["text"] for chunk in chunks]
+    embeddings = embedder.encode(
+        texts,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
     return index
 
 
-def retrieve(query, embedder, index, chunks, top_k=TOP_K):
-    """Returns a list of (chunk_number, chunk_text, similarity_score), ranked best first."""
-    q_emb = embedder.encode([query], normalize_embeddings=True)
-    q_emb = np.array(q_emb, dtype="float32")
-    scores, idxs = index.search(q_emb, top_k)
-    results = [
-        (int(i) + 1, chunks[i], float(score))
-        for i, score in zip(idxs[0], scores[0])
-        if i != -1
-    ]
+def retrieve(
+    query: str,
+    embedder,
+    index,
+    chunks: List[Dict[str, Any]],
+    top_k: int = TOP_K,
+):
+    """Return matching chunk metadata and similarity scores, best first."""
+    if index is None or not chunks:
+        return []
+
+    query_embedding = embedder.encode(
+        [query],
+        normalize_embeddings=True,
+    )
+    query_embedding = np.asarray(query_embedding, dtype=np.float32)
+
+    k = min(top_k, len(chunks))
+    scores, indices = index.search(query_embedding, k)
+
+    results = []
+    for idx, score in zip(indices[0], scores[0]):
+        if idx == -1:
+            continue
+
+        result = dict(chunks[int(idx)])
+        result["chunk_id"] = int(idx) + 1
+        result["score"] = float(score)
+        results.append(result)
+
     return results
 
 
-def ask_gemini(client, question, retrieved, low_confidence: bool):
-    """Calls Gemini with retry logic for transient server errors (5xx).
-    Raises the original exception if all retries are exhausted, or immediately
-    for non-retryable errors (e.g. bad API key)."""
-    doc_metadata = "\n\n".join(st.session_state.get("front_matters", []))
-    retrieved_context = "\n\n---\n\n".join(chunk_text for _, chunk_text, _ in retrieved)
-    context = f"Document metadata (title/author/etc.):\n{doc_metadata}\n\n---\n\nRetrieved passages:\n{retrieved_context}"
-
-    base_instructions = (
-        "You are a study assistant. Answer the user's question using ONLY the "
-        "context provided below. If the answer isn't in the context, say so clearly "
-        "instead of guessing. Keep answers clear and well-explained, like a tutor."
-    )
-    if low_confidence:
-        base_instructions += (
-            " IMPORTANT: none of the retrieved passages closely match this question. "
-            "Be extra cautious - if you can't find a clear, direct answer in the context, "
-            "say so explicitly rather than piecing together a guess."
+# ---------------------------------------------------------------------------
+# Gemini generation with retry logic
+# ---------------------------------------------------------------------------
+def ask_gemini(client, question: str, retrieved, low_confidence: bool) -> str:
+    """Generate an answer using retrieved passages and retry server errors."""
+    context_parts = []
+    for item in retrieved:
+        page_label = (
+            f", page {item['page']}" if item.get("page") is not None else ""
+        )
+        context_parts.append(
+            f"[Source: {item['source']}{page_label}; "
+            f"chunk {item['chunk_id']}]\n{item['text']}"
         )
 
-    user_message = f"Context:\n{context}\n\nQuestion: {question}"
+    retrieved_context = "\n\n---\n\n".join(context_parts)
+
+    if not retrieved_context:
+        retrieved_context = "No relevant passages were retrieved."
+
+    system_instruction = (
+        "You are a study assistant. Answer using only the provided document "
+        "context. If the answer is not clearly supported by the context, say "
+        "that the uploaded documents do not contain enough information. "
+        "Do not invent citations or facts. Explain clearly like a tutor."
+    )
+
+    if low_confidence:
+        system_instruction += (
+            " Retrieval similarity is low. Be especially cautious and do not "
+            "infer an answer from weakly related passages."
+        )
+
+    user_message = (
+        f"Document context:\n{retrieved_context}\n\n"
+        f"Question: {question}\n\n"
+        "When possible, mention the source filename and page number that "
+        "supports the answer."
+    )
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -166,59 +292,104 @@ def ask_gemini(client, question, retrieved, low_confidence: bool):
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=user_message,
-                config={"system_instruction": base_instructions, "max_output_tokens": 1000},
+                config={
+                    "system_instruction": system_instruction,
+                    "max_output_tokens": 1000,
+                },
             )
+            if not response.text:
+                raise ValueError("Gemini returned an empty response.")
             return response.text
-        except genai_errors.ServerError as e:
-            # Transient issue on Google's side (e.g. 503 "high demand") - worth retrying.
-            last_error = e
+
+        except genai_errors.ServerError as exc:
+            last_error = exc
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
-            continue
+                delay = RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                time.sleep(delay)
+
         except genai_errors.ClientError:
-            # e.g. 400 invalid API key, invalid request - retrying won't help, fail fast.
+            # Invalid key/request/permissions usually need user action.
             raise
 
-    # All retries exhausted - raise the last error so the caller can show a clean message.
     raise last_error
 
 
+# ---------------------------------------------------------------------------
+# Source rendering
+# ---------------------------------------------------------------------------
 def render_sources(retrieved, low_confidence: bool):
     if low_confidence:
         st.warning(
-            "Retrieval confidence "
-            f"{CONFIDENCE_THRESHOLD}."
+            "The best retrieved similarity score is below "
+            f"{CONFIDENCE_THRESHOLD:.2f}. Check the sources carefully."
         )
+
     with st.expander(f"Sources used ({len(retrieved)} chunks)"):
-        for chunk_num, chunk_txt, score in retrieved:
-            st.markdown(f"**Chunk {chunk_num}** - similarity score: `{score:.3f}`")
-            st.text(chunk_txt[:400] + ("..." if len(chunk_txt) > 400 else ""))
+        if not retrieved:
+            st.write("No matching passages were found.")
+        for item in retrieved:
+            page_label = (
+                f" | Page {item['page']}"
+                if item.get("page") is not None
+                else ""
+            )
+            st.markdown(
+                f"**{item['source']}{page_label} — "
+                f"Chunk {item['chunk_id']}** "
+                f"| Similarity: `{item['score']:.3f}`"
+            )
+            if item.get("oversize"):
+                st.caption(
+                    "Note: this chunk exceeds the configured token budget "
+                    "because a sentence was kept intact."
+                )
+            text = item["text"]
+            st.text(text[:800] + ("..." if len(text) > 800 else ""))
             st.divider()
 
 
 # ---------------------------------------------------------------------------
-# Streamlit UI
+# Streamlit state and sidebar
 # ---------------------------------------------------------------------------
-st.title("📚 Notes RAG Chat")
-st.caption("Upload your notes or PDFs, then ask questions grounded in them.")
-
 with st.sidebar:
     st.header("Setup")
-    default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
-    api_key = st.text_input("Gemini API key", type="password", value=default_key)
-    st.markdown("[Get a free key from Google AI Studio](https://aistudio.google.com/apikey)")
 
-    st.divider()
-    uploaded_files = st.file_uploader(
-        "Upload PDF or TXT files", type=["pdf", "txt"], accept_multiple_files=True
+    try:
+        default_key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        default_key = ""
+
+    api_key = st.text_input(
+        "Gemini API key",
+        type="password",
+        value=default_key,
     )
-    build_button = st.button("Build knowledge base", type="primary")
+    st.markdown(
+        "[Get a key from Google AI Studio]"
+        "(https://aistudio.google.com/apikey)"
+    )
+    st.divider()
+
+    uploaded_files = st.file_uploader(
+        "Upload PDF or TXT files",
+        type=["pdf", "txt"],
+        accept_multiple_files=True,
+    )
+    build_button = st.button(
+        "Build knowledge base",
+        type="primary",
+    )
 
 if "index" not in st.session_state:
     st.session_state.index = None
     st.session_state.chunks = []
     st.session_state.messages = []
+    st.session_state.front_matters = []
 
+
+# ---------------------------------------------------------------------------
+# Build/rebuild the knowledge base
+# ---------------------------------------------------------------------------
 if build_button:
     if not uploaded_files:
         st.sidebar.error("Upload at least one file first.")
@@ -226,62 +397,143 @@ if build_button:
         with st.spinner("Reading files and building index..."):
             embedder = load_embedder()
             all_chunks = []
-            for f in uploaded_files:
-                text = extract_text(f)
-                front_matter, body = split_front_matter(text)
-                if front_matter:
-                    st.session_state.setdefault("front_matters", []).append(front_matter)
-                all_chunks.extend(chunk_text(body))
+            front_matters = []
+
+            # Reset all document-specific data before rebuilding. This avoids
+            # carrying metadata or chunks over from a previous upload batch.
+            st.session_state.index = None
+            st.session_state.chunks = []
+            st.session_state.messages = []
+            st.session_state.front_matters = []
+
+            for uploaded_file in uploaded_files:
+                documents = extract_documents(uploaded_file)
+
+                for document in documents:
+                    front_matter, body = split_front_matter(
+                        document["text"]
+                    )
+
+                    if front_matter:
+                        front_matters.append({
+                            "source": document["source"],
+                            "page": document["page"],
+                            "text": front_matter,
+                        })
+
+                    all_chunks.extend(
+                        chunk_document(
+                            text=body,
+                            source=document["source"],
+                            page=document["page"],
+                            embedder=embedder,
+                        )
+                    )
 
             if not all_chunks:
-                st.sidebar.error("Couldn't extract any text from the uploaded files.")
+                st.sidebar.error(
+                    "Couldn't extract usable text from the uploaded files. "
+                    "Scanned PDFs may require OCR."
+                )
             else:
-                st.session_state.index = build_index(all_chunks, embedder)
+                st.session_state.index = build_index(
+                    all_chunks,
+                    embedder,
+                )
                 st.session_state.chunks = all_chunks
-                st.session_state.messages = []
-                st.sidebar.success(f"Indexed {len(all_chunks)} chunks from {len(uploaded_files)} file(s).")
+                st.session_state.front_matters = front_matters
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if "retrieved" in msg:
-            render_sources(msg["retrieved"], msg.get("low_confidence", False))
+                st.sidebar.success(
+                    f"Indexed {len(all_chunks)} chunks "
+                    f"from {len(uploaded_files)} file(s)."
+                )
 
-question = st.chat_input("Ask a question about your uploaded documents...")
+                oversize_count = sum(
+                    1 for chunk in all_chunks if chunk["oversize"]
+                )
+                if oversize_count:
+                    st.sidebar.warning(
+                        f"{oversize_count} chunk(s) exceed the token budget "
+                        "because a sentence was kept intact."
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Conversation display
+# ---------------------------------------------------------------------------
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if "retrieved" in message:
+            render_sources(
+                message["retrieved"],
+                message.get("low_confidence", False),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Question handling
+# ---------------------------------------------------------------------------
+question = st.chat_input(
+    "Ask a question about your uploaded documents..."
+)
 
 if question:
     if st.session_state.index is None:
-        st.error("Build the knowledge base first (upload files + click 'Build knowledge base').")
+        st.error(
+            "Build the knowledge base first "
+            "(upload files and click 'Build knowledge base')."
+        )
     elif not api_key:
         st.error("Enter your Gemini API key in the sidebar.")
     else:
-        st.session_state.messages.append({"role": "user", "content": question})
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question,
+        })
+
         with st.chat_message("user"):
             st.markdown(question)
 
         with st.chat_message("assistant"):
-            with st.spinner("Retrieving relevant chunks and generating answer..."):
+            with st.spinner(
+                "Retrieving relevant chunks and generating answer..."
+            ):
                 embedder = load_embedder()
-                retrieved = retrieve(question, embedder, st.session_state.index, st.session_state.chunks)
-                low_confidence = (not retrieved) or (retrieved[0][2] < CONFIDENCE_THRESHOLD)
+                retrieved = retrieve(
+                    question,
+                    embedder,
+                    st.session_state.index,
+                    st.session_state.chunks,
+                )
+
+                low_confidence = (
+                    not retrieved
+                    or retrieved[0]["score"] < CONFIDENCE_THRESHOLD
+                )
 
                 client = genai.Client(api_key=api_key)
+                answer = None
 
                 try:
-                    answer = ask_gemini(client, question, retrieved, low_confidence)
+                    answer = ask_gemini(
+                        client,
+                        question,
+                        retrieved,
+                        low_confidence,
+                    )
                 except genai_errors.ServerError:
-                    answer = None
                     st.error(
-                        "Gemini's servers are currently overloaded and didn't respond after "
-                        f"{MAX_RETRIES} attempts. This is temporary - please try asking again "
-                        "in a moment."
+                        "Gemini's servers did not respond after "
+                        f"{MAX_RETRIES} attempts. Please try again shortly."
                     )
-                except genai_errors.ClientError as e:
-                    answer = None
+                except genai_errors.ClientError as exc:
                     st.error(
-                        "Gemini rejected the request - this usually means the API key is "
-                        f"invalid or missing permissions. Details: {e}"
+                        "Gemini rejected the request. Check your API key, "
+                        f"permissions, and request. Details: {exc}"
                     )
+                except ValueError as exc:
+                    st.error(str(exc))
 
                 if answer is not None:
                     st.markdown(answer)
